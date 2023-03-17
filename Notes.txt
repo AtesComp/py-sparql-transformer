@@ -1,0 +1,46 @@
+Make SPARQLTransformer a class:
+  transform function parameters to class variables
+    json_query -> self.objQuery
+    options -> self.dictOptions
+  add __init__(objQuery, dictOptions) function
+    initialize class variables:
+      self.objQuery = deepcopy of objQuery
+      self.dictJSONQuery = None (to be working copy of self.objQuery or file input)
+      self.dictOptions = copy of defaults and updated with dictOptions
+    self.objQuery replaces _input
+    self.dictJSONQuery replaces final working copy of _input
+    self.dictOptions replaces opt, options
+    move copy() and deepcopy() to __init__() for class variables
+    use dictionary update() to update self.dictOptions with dictOptions
+  rename existing function for class public and private use
+    sparqlTransformer() -> transform()
+    _default_sparql -> __defaultSPARQLQuery()
+    _pre_process() -> __preProcess()
+      initialization code moved to __init__
+    _jsonld2query() -> __createSPARQLQuery()
+    post_process() -> __postProcess()
+    create __processBindings from __postProcess() binding code and _sparql2proto()
+    _merge_obj() -> __mergeObject()
+    clean_recursively() -> __recursiveClean()
+    _parse_prefixes() -> __parsePrefixes()
+    normalize_values() -> __normalizeValues()
+    _manage_proto_key() -> __processProperties() and rearrrange parameters for applied use
+    parse_values -> __parseValues() and extend with prefixes
+    _fit_in() -> __fitResult() and unwind fit()
+    _to_jsonld_value() -> __toJSONLDValue() and extend to properly process literals
+    _deepequals() -> __deepEquals()
+    _sparql_var() -> __makeSPARQLVariable()
+    _manage_proto_key() with inner() -> __processProperties() with processWhere()
+    _compute_root_id() -> __computeRootID()
+    _prepare_groupby() -> __prepareGroupBy()
+    _prepare_orderby() -> generic __prepareSomeBy()
+  remove _as_array()
+Add isCIRIE(), isBlank(), and isCIRIEorBlank() helper functions
+Standardize log messages
+Make XSD class to contain XSD related code for better management
+Add date and datetime types for XSD and Known Types
+Minimize and normalize indents
+Manage type and dtype with id, value, and lang
+Differentiate values as uri and literal from results
+Extend FROM
+Add FROM NAMED

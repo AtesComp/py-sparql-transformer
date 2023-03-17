@@ -1,639 +1,887 @@
-import logging
-import pprint
 import os
 import re
 import json
 import copy
 from SPARQLWrapper import SPARQLWrapper, JSON
 from simplejson import dumps
+from typing import Callable
+import pprint
+import logging
+#import sys
+#from loguru import logger # ...alternate logger
 
-INDENT = '          '
-
-DEFAULT_OPTIONS = {
-    'context': 'http://schema.org/',
-    'endpoint': 'http://dbpedia.org/sparql',
-    'langTag': 'show'
-}
-
-KEY_VOCABULARIES = {
-    'JSONLD': {
-        'id': '@id',
-        'lang': '@language',
-        'value': '@value'
-    },
-    'PROTO': {
-        'id': 'id',
-        'lang': 'language',
-        'value': 'value'
-    }
-}
-
-LANG_REGEX = re.compile(r"^lang(?::(.+))?")
-AGGREGATES = ['sample', 'count', 'sum', 'min', 'max', 'avg']
-
+# Setup Logging...
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.WARNING)
 logger = logging.getLogger('sparql_transformer')
+#logger.remove()
+#logger.add(sys.stderr, level="WARNING")
+
+INDENT = '  '
+
+class XSD:
+    _XSD = 'http://www.w3.org/2001/XMLSchema#'
+
+    def _xsd(resource):
+        return XSD._XSD + resource
+
+    XSD_INT_TYPES = [
+        _xsd('integer'), _xsd('nonPositiveInteger'), _xsd('negativeInteger'),
+        _xsd('nonNegativeInteger'), _xsd('positiveInteger'),
+        _xsd('long'), _xsd('int'), _xsd('short'), _xsd('byte'),
+        _xsd('unsignedLong'), _xsd('unsignedInt'), _xsd('unsignedShort'), _xsd('unsignedByte')
+    ]
+    XSD_BOOLEAN_TYPES = [ _xsd('boolean') ]
+    XSD_FLOAT_TYPES = [ _xsd('decimal'), _xsd('float'), _xsd('double') ]
+    XSD_DATE_TYPES = [ _xsd('date'), _xsd('dateTime') ]
 
 
-def pre_process(json_query, options=None):
-    _input = json_query.copy()
-    opt = DEFAULT_OPTIONS.copy()
-    if '@context' in _input:
-        opt['context'] = _input['@context']
-    if options is not None:
-        opt.update(options)
+class SPARQLTransformer:
 
-    if 'debug' in opt and opt['debug']:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.NOTSET)
+    _DEFAULT_OPTIONS = {
+        'context': 'http://schema.org/',
+        'endpoint': 'http://dbpedia.org/sparql', # ...or NONE
+        'langTag': 'show'
+    }
 
-    logger.debug('OPTIONS:')
-    if logger.getEffectiveLevel() == logging.DEBUG:
-        pprint.pprint(opt)
+    _KEY_VOCABULARIES = {
+        'JSONLD': {
+            'id': '@id',
+            'type': '@type',
+            'value': '@value',
+            'lang': '@language',
+            'dtype': '@datatype'
+        },
+        'PROTO': {
+            'id': 'id',
+            'type': 'type',
+            'value': 'value',
+            'lang': 'language',
+            'dtype': 'datatype'
+        }
+    }
 
-    if isinstance(_input, str):
-        if os.path.isfile(_input):
-            with open(_input) as data:
-                _input = json.load(data)
+    _LANG_REGEX = re.compile(r"^lang(?::(.+))?")
+    _AGGREGATES = ['sample', 'count', 'sum', 'min', 'max', 'avg']
+
+    _RDF_VALUE_TYPES = ['uri', 'literal']
+
+    _KNOWN_ACCESS_TYPES = {
+        'int': [int],
+        'float': [float],
+        'number': [int, float],
+        'str': [str],
+        'string': [str],
+        'boolean': [bool],
+        'bool': [bool],
+        'date': [str],
+        'datetime': [str]
+    }
+
+    def __init__(self, objQuery: str | dict, dictOptions: dict | None = None ):
+        self.objQuery = copy.deepcopy(objQuery)
+        self.dictJSONQuery = None
+        self.dictOptions = SPARQLTransformer._DEFAULT_OPTIONS.copy()
+        if dictOptions is not None:
+            self.dictOptions.update(dictOptions)
+        self.logLevel = None
+        if 'debug' in self.dictOptions and self.dictOptions['debug']:
+            self.logLevel = logging.DEBUG
+            logger.setLevel(self.logLevel) # 10
+            #self.logLevel = logger.level("DEBUG").no # 10
+            #logger.remove()
+            #logger.add(sys.stderr, level=self.logLevel)
         else:
-            return logger.error('Wrong input. I require a path to a JSON file')
-    elif not isinstance(_input, dict):
-        return logger.error('Input format not valid')
-    else:
-        _input = copy.deepcopy(_input)
-
-    #   I save the info about hideLang before it is destroyed
-    if '$langTag' in _input:
-        opt['langTag'] = _input['$langTag']
-
-    proto, query = _jsonld2query(_input)
-
-    is_json_ld = '@graph' in _input
-    voc = KEY_VOCABULARIES['JSONLD' if is_json_ld else 'PROTO']
-    opt['voc'] = voc
-    opt['is_json_ld'] = is_json_ld
-
-    if '$limitMode' in json_query and '$limit' in json_query:
-        opt['limit'] = json_query['$limit']
-        opt['offset'] = json_query.get('$offset', 0)
-
-    return query, proto, opt
+            self.logLevel = logging.WARNING
+            logger.setLevel(self.logLevel) # 30 (Normal), logging.NOTSET == 0
+            #self.logLevel = logger.level("WARNING").no # 30
+            #logger.remove()
+            #logger.add(sys.stderr, level=self.logLevel)
 
 
-def post_process(sparql_res, proto, opt):
-    is_json_ld = opt['is_json_ld']
+    def transform(self):
+        self.__preProcess()
 
-    bindings = sparql_res['results']['bindings']
-    # apply the proto
-    instances = list(map(lambda b: _sparql2proto(b, proto, opt), bindings))
-    # merge lines with the same id
-    content = []
-    anchor = instances[0]['$anchor'] if (len(instances) > 0 and '$anchor' in instances[0]) else None
-    if not anchor:
-        content = instances
-    else:
-        for inst in instances:
-            _id = inst[anchor]
-            # search if we have already the same id
-            match = [x for x in content if x[anchor] == _id]
-            if not match:  # it is a new one
-                content.append(inst)
-            else:  # otherwise modify previous one
-                _merge_obj(match[0], inst)
+        funcSPAQRLQuery = self.dictOptions['sparqlFunction'] if 'sparqlFunction' in self.dictOptions else self.__defaultSPARQLQuery()
+        self.dictSPARQLResults = funcSPAQRLQuery(self.strSPARQLQuery)
 
-    # remove anchor tag
-    for i in content:
-        clean_recursively(i)
+        logger.debug(self.dictSPARQLResults)
 
-    if 'limit' in opt:
-        content = content[opt['offset']: opt['offset'] + opt['limit']]
+        # Process raw self.dictSPARQLResults into self.objResults...
+        self.__postProcess()
+        return self.objResults # list or dict
 
-    if is_json_ld:
-        return {
-            '@context': opt['context'],
-            '@graph': content
-        }
-    return content
-
-
-def sparqlTransformer(_input, options=None):
-    query, proto, opt = pre_process(_input, options)
-    sparql_fun = opt['sparqlFunction'] if 'sparqlFunction' in opt else _default_sparql(opt['endpoint'])
-    sparql_res = sparql_fun(query)
-
-    logger.debug(sparql_res)
-
-    return post_process(sparql_res, proto, opt)
-
-
-def _jsonld2query(_input):
-    """Read the input and extract the query and the prototype"""
-    proto = _input['@graph'] if '@graph' in _input else _input['proto']
-    if isinstance(proto, list):
-        proto = proto[0]
-
-    # get all props starting with '$'
-    modifiers = {}
-    for k in list(_input):
-        if not k.startswith('$'):
-            continue
-        modifiers[k] = _input.pop(k, None)
-
-    _vars = []
-    filters = _as_array(modifiers.get('$filter'))
-    wheres = _as_array(modifiers.get('$where'))
-    main_lang = modifiers.get('$lang')
-
-    values_normalized = normalize_values(modifiers.get('$values', None))
-    mpk_fun, _temp = _manage_proto_key(proto, _vars, filters, wheres, main_lang, values=values_normalized)
-    for i, key in enumerate(list(proto)):
-        mpk_fun(key, i)
-
-    wheres = [w.strip() for w in wheres]
-    wheres = [w for w in wheres if w]
-
-    _from = ('FROM <%s>' % modifiers['$from']) if '$from' in modifiers else ''
-    limit = ('LIMIT %d' % modifiers['$limit']) if (
-            '$limit' in modifiers and modifiers.get('$limitMode') != 'library') else ''
-    offset = 'OFFSET ' + str(modifiers['$offset']) if (
-            '$offset' in modifiers and modifiers.get('$limitMode') != 'library') else ''
-    distinct = '' if ('$distinct' in modifiers and modifiers['$distinct'] == 'false') else 'DISTINCT'
-    prefixes = _parse_prefixes(modifiers['$prefixes']) if '$prefixes' in modifiers else []
-    values = parse_values(values_normalized) if '$values' in modifiers else []
-    orderby = 'ORDER BY ' + ' '.join(_as_array(modifiers['$orderby'])) if '$orderby' in modifiers else ''
-    groupby = 'GROUP BY ' + ' '.join(_as_array(modifiers['$groupby'])) if '$groupby' in modifiers else ''
-    having = 'HAVING(%s)' % ' && '.join(_as_array(modifiers['$having'])) if '$having' in modifiers else ''
-
-    filterz = list(map(lambda f: 'FILTER(%s)' % f, filters))
-    query = '\n'.join(prefixes) + """
-        SELECT %s %s
-        %s
-        WHERE {
-          %s
-          %s
-          %s
-        }
-        %s
-        %s
-        %s
-        %s
-        %s
-    """ % (distinct, ' '.join(_vars), _from, ('\n' + INDENT).join(values), ('.\n' + INDENT).join(wheres),
-           ('\n' + INDENT).join(filterz),
-           groupby, having, orderby, limit, offset)
-
-    query = re.sub(r"\n+", "\n", query)
-    query = re.sub(r"\n\s+\n", "\n", query)
-    query = re.sub(r"\.+", ".", query)
-    logger.info(query)
-    return proto, query
-
-
-def normalize_values(values):
-    """
-    Transform all key of a object to a sparqlVariable
-    adding the '?' if required
-    """
-    if values is None:
-        return {}
-    out = dict()
-    for key, value in values.items():
-        out[_sparql_var(key)] = value
-    return out
-
-
-def _default_sparql(endpoint):
-    sparql = SPARQLWrapper(endpoint)
-    sparql.setReturnFormat(JSON)
-
-    def exec_query(q):
-        sparql.setQuery(q)
-        return sparql.query().convert()
-
-    return exec_query
-
-
-def _parse_prefixes(prefixes):
-    return list(map(lambda key: 'PREFIX %s: <%s>' % (key, prefixes[key]), prefixes.keys()))
-
-
-def parse_values(values):
-    res = []
-    for p in list(values):
-        __v = []
-
-        for v in _as_array(values[p]):
-            if type(v) == str:
-                if v.startswith('http'):
-                    __v.append(f'<{v}>')
-                elif ':' in v:
-                    __v.append(v)
-                elif re.match(r'^.+@[a-z]{2,3}(_[A-Z]{2})?$', v):
-                    vv, langtag = v.split('@')
-                    __v.append(f'"{vv}"@{langtag}')
-                else:
-                    __v.append(f'"{v}"')
+    def __preProcess(self):
+        if isinstance(self.objQuery, str):
+            if os.path.isfile(self.objQuery):
+                with open(self.objQuery) as data:
+                    self.dictJSONQuery = json.load(data)
             else:
-                __v.append(v)
-        res.append('VALUES %s {%s}' % (_sparql_var(p), ' '.join(map(str, __v))))
-    return res
-
-
-def _sparql2proto(line, proto, options):
-    """Apply the prototype to a single line of query results"""
-    instance = copy.deepcopy(proto)
-
-    fii_fun = _fit_in(instance, line, options)
-    for key in list(instance):
-        fii_fun(key)
-    return instance
-
-
-def _fit_in(instance, line, options):
-    """Apply the result of SPARQL to a single property of the proto instance"""
-
-    def fit(k):
-        variable = instance[k]
-
-        # if value is an obj
-        if isinstance(variable, dict):
-            obj_as_list = variable.get('$list', variable.get('$asList', False))
-            fii_fun = _fit_in(variable, line, options)
-            for key in list(variable):
-                fii_fun(key)
-            if _is_empty_obj(variable):
-                instance.pop(k)
-            elif obj_as_list:
-                instance[k] = [instance[k]]
-            return
-
-        if not isinstance(variable, str):
-            return
-
-        if not variable.startswith('?'):
-            return
-
-        variable = variable[1:]
-        accept = None
-        langTag = options['langTag']
-        asList = '$list' in variable or '$asList' in variable
-        variable = re.sub(r'\$(asL|l)ist', '', variable)
-
-        if "$accept:" in variable:
-            temp = variable.split('$accept:')
-            variable = temp[0]
-            accept = temp[1]
-        if "$langTag:" in variable:
-            temp = variable.split('$langTag:')
-            variable = temp[0]
-            langTag = temp[1]
-
-        # variable not in result, delete from
-        if variable not in line:
-            instance.pop(k)
+                return logger.error('ERROR: A path to a JSON file is required!')
+        elif not isinstance(self.objQuery, dict):
+            return logger.error('ERROR: Input format not valid!')
         else:
-            opt = options.copy()
-            opt['accept'] = accept
-            opt['langTag'] = langTag
-            opt['list'] = asList
-            instance[k] = _to_jsonld_value(line[variable], opt)
+            self.dictJSONQuery = copy.deepcopy(self.objQuery)
 
-            if instance[k] is None:
-                instance.pop(k)
+        if '@context' in self.dictJSONQuery:
+            self.dictOptions['context'] = self.dictJSONQuery['@context']
 
-        return instance
+        logger.debug('OPTIONS:\n' + pprint.pformat(self.dictOptions))
 
-    return fit
+        # Save info for "hideLang" before it is destroyed...
+        if '$langTag' in self.dictJSONQuery:
+            self.dictOptions['langTag'] = self.dictJSONQuery['$langTag']
 
+        isJSONLD = '@graph' in self.dictJSONQuery
+        self.dictOptions['is_json_ld'] = isJSONLD
+        objVocab = SPARQLTransformer._KEY_VOCABULARIES['JSONLD' if isJSONLD else 'PROTO']
+        self.dictOptions['voc'] = objVocab
 
-def _is_empty_obj(target):
-    for key in list(target):
-        if key not in ['@type', '$anchor']:
-            return False
-    return True
+        self.__createSPARQLQuery()
 
+        if '$limitMode' in self.dictJSONQuery and '$limit' in self.dictJSONQuery:
+            self.dictOptions['limit'] = self.dictJSONQuery['$limit']
+            self.dictOptions['offset'] = self.dictJSONQuery.get('$offset', 0)
 
-XSD = 'http://www.w3.org/2001/XMLSchema#'
-
-
-def xsd(resource):
-    return XSD + resource
-
-
-XSD_INT_TYPES = [xsd('integer'), xsd('nonPositiveInteger'), xsd('negativeInteger'),
-                 xsd('nonNegativeInteger'), xsd('xs,positiveInteger'),
-                 xsd('long'), xsd('int'), xsd('short'), xsd('byte'),
-                 xsd('unsignedLong'), xsd('unsignedInt'), xsd('unsignedShort'), xsd('unsignedByte')]
-
-XSD_FLOAT_TYPES = [xsd('decimal'), xsd('float'), xsd('double')]
-
-known_types = {
-    'int': [int],
-    'float': [float],
-    'number': [int, float],
-    'str': [str],
-    'string': [str],
-    'boolean': [bool],
-    'bool': [bool]
-}
-
-
-def _to_jsonld_value(_input, options):
-    """Prepare the output managing languages and datatypes"""
-    value = _input['value']
-    if 'datatype' in _input:
-        if _input['datatype'] == xsd('boolean'):
-            value = value not in ['false', '0', 0, 'False', False]
-        elif _input['datatype'] in XSD_INT_TYPES:
-            value = int(value)
-        elif _input['datatype'] in XSD_FLOAT_TYPES:
-            value = value.replace('INF', 'inf')
-            value = float(value)
-
-    # I can't accept 0 if I want a string
-    if 'accept' in options and options.get('accept') is not None:
-        if type(value) not in known_types[options.get('accept')]:
-            return None
-
-    # nothing more to do for other types
-    if not isinstance(value, str):
-        return [value] if options['list'] else value
-
-    # if here, it is a string or a date, that are not parsed
-    if 'xml:lang' in _input and options['langTag'] != 'hide':
-        lang = _input['xml:lang']
-
-        voc = options['voc']
-        if lang:
-            return {
-                voc['lang']: lang,
-                voc['value']: value
-            }
-    return [value] if options['list'] else value
-
-
-def _merge_obj(base, addition):
-    """Merge base and addition, by defining/adding in an array the values in addition to the base object.
-    Return the base object merged."""
-    for k in list(addition):
-        if k == '$anchor':
-            continue
-
-        a = addition[k]
-        if k not in base:
-            base[k] = a
-            continue
-
-        b = base[k]
-
-        anchor = None
-        if isinstance(a, dict) and '$anchor' in a:
-            anchor = a['$anchor']
-
-        # if a is array, I take its value
-        if isinstance(a, list):
-            a = a[0]
-
-        if isinstance(b, list):
-            if anchor:
-                same_ids = [x for x in b if anchor in x and a[anchor] == x[anchor]]
-                if len(same_ids) > 0:
-                    _merge_obj(same_ids[0], a)
-                    continue
-
-            if not any([_deepequals(x, a) for x in b]):
-                b.append(a)
-            continue
-
-        if _deepequals(a, b):
-            continue
-
-        if anchor and anchor in b and a[anchor] == b[anchor]:  # same ids
-            _merge_obj(b, a)
-        else:
-            base[k] = [b, a]
-
-    return base
-
-
-def _compute_root_id(proto, prefix):
-    k = None
-
-    # check if an anchor is set
-    for key, value in proto.items():
-        if type(value) == str and '$anchor' in value:
-            k = key
-            break
-
-    # otherwise, check if one of the default anchors is there
-    if k is None:
-        for key, value in KEY_VOCABULARIES.items():
-            if KEY_VOCABULARIES[key]['id'] in proto:
-                k = KEY_VOCABULARIES[key]['id']
-                break
-
-    if k is None:
-        return None, None
-
-    txt = proto[k]
-    modifiers = txt.split('$')
-    _rootId = modifiers.pop(0)
-
-    required = True if 'required' in modifiers else (not not _rootId)
-    _var = [s for s in modifiers if s.startswith('var:')]
-    if len(_var) > 0:
-        _rootId = _sparql_var(_var[0].split(':')[1])
-
-    if not _rootId:  # generate it
-        _rootId = "?" + prefix + "r"
-        proto[k] += '$var:' + _rootId
-
-    proto['$anchor'] = k
-    proto['$list'] = '$list' in proto[k] or '$asList' in proto[k]
-    return _rootId, required
-
-
-def _sparql_var(_input):
-    """Add the "?" if absent"""
-    return _input if _input.startswith('?') else '?' + _input
-
-
-def _manage_proto_key(proto, vars=[], filters=[], wheres=[], main_lang=None, prefix="v", prev_root=None, values={}):
-    """Parse a single key in prototype"""
-    _rootId, _blockRequired = _compute_root_id(proto, prefix)
-    _rootId = _rootId or prev_root or '?id'
-
-    def inner(k, i=''):
-        if k in ['$anchor', '$list', '$asList']:
-            return
-        v = proto[k]
-        if isinstance(v, dict):
-            wheres_internal = []
-            mpk_fun, bk_req = _manage_proto_key(v, vars, filters, wheres_internal,
-                                                main_lang, prefix + str(i), _rootId, values)
-
-            for i, k in enumerate(list(v)):
-                mpk_fun(k, i)
-
-            wheres_internal = '.\n'.join(wheres_internal)
-            wheres.append(wheres_internal if bk_req else 'OPTIONAL { %s }' % wheres_internal)
-            return
-
-        if not isinstance(v, str):
-            return
-
-        is_dollar = v.startswith('$')
-        if not is_dollar and not v.startswith('?'):
-            return
-        if is_dollar:
-            v = v[1:]
-
-        options = []
-        if '$' in v:
-            options = v.split('$')
-            v = options.pop(0)
-
-        original_id = ('?' + prefix + str(i)) if is_dollar else v
-        id = original_id
-
-        _var = [s for s in options if s.startswith('var:')]
-        if len(_var) > 0:
-            id = _sparql_var(_var[0].split(':')[1])
-            if not id.startswith('?'):
-                id = '?' + id
-
-        _accept = [s for s in options if s.startswith('accept')]
-        _bestlang = [s for s in options if s.startswith('bestlang')]
-        _langTag = [s for s in options if s.startswith('langTag')]
-
-        aggregate = [a for a in AGGREGATES if a in options]
-        aggr_what = id if is_dollar else original_id
-        if len(aggregate) > 0 and len(_var) == 0:
-            id = original_id if is_dollar else f"?{aggregate[0]}_{original_id.replace('?', '')}"
-
-        required = 'required' in options or k in ['id', '@id'] or id in values or (len(aggregate) > 0 and is_dollar)
-        # if it is an id or I specified a value, this property can not be optional
-
-        proto[k] = id
-
-        _var = id
-        if 'sample' in options:
-            _var = '(SAMPLE(%s) AS %s)' % (id, id)
-
-        if len(aggregate) > 0:
-            distinct_txt = 'DISTINCT ' if 'distinct' in options else ''
-            _var = f"({aggregate[0].upper()}({distinct_txt}{aggr_what}) AS {id})"
-
-        if len(_bestlang) > 0:
-            _bestlang = _bestlang[0]
-            proto[k] = id + '$accept:string'
-            lng = _bestlang.split(':')[1] if ':' in _bestlang else main_lang
-            if lng is None:
-                raise AttributeError('bestlang require a language declared inline or in the root')
-
-            _var = '(sql:BEST_LANGMATCH(%s, "%s", "en") AS %s)' % (id, lng, id)
-        elif len(_accept) > 0:
-            proto[k] = id + '$' + _accept[0]
-
-        if len(_langTag) > 0:
-            proto[k] = proto[k] + '$' + _langTag[0]
-
-        if ('list' in options or 'asList' in options) and id != _rootId:
-            proto[k] += '$list'
-
-        if _var not in vars:
-            vars.append(_var)
-
-        # lang filters are managed here, so that they stay within the OPTIONAL
-        lang_filter = ''
-        _lang = [LANG_REGEX.match(s).group(1) for s in options if LANG_REGEX.match(s)]
-
-        if len(_lang) > 0:
-            _lang = _lang[0]
-            if _lang is None and main_lang is not None:
-                _lang = re.split('[;,]', main_lang)[0]
-            if _lang:
-                _lang = _lang.strip()
-                if id in values and type(values[id]) == str:
-                    values[id] += '@' + _lang
-                else:
-                    lang_filter = ".\n%sFILTER(lang(%s) = '%s')" % (INDENT, id, _lang)
-
-        reverse = 'reverse' in options
-        if is_dollar:
-            use_prev_root = (id == _rootId) or ('prevRoot' in options and prev_root is not None)
-
-            subject = prev_root if use_prev_root else _rootId
-
-            subj = id if reverse else subject
-            obj = subject if reverse else id
-
-            q = ' '.join([subj, v, obj])
-            q += lang_filter
-            wheres.append(q if required else '%sOPTIONAL { %s }' % (INDENT, q))
-
-    return inner, _blockRequired
-
-
-def _prepare_groupby(array=None):
-    if array is None:
-        return ''
-
-    for s in array:
-        if 'desc' in s:
-            s.pop('desc')
-
-    return _prepare_orderby(array, 'GROUP BY')
-
-
-# Remove development properties
-def clean_recursively(instance):
-    if isinstance(instance, list):
-        for i in instance:
-            clean_recursively(i)
         return
 
-    if isinstance(instance, dict):
-        instance.pop('$anchor', None)  # remove $anchor
-        instance.pop('$list', None)  # remove $anchor
-        instance.pop('$asList', None)  # remove $anchor
-        for k, v in instance.items():
-            clean_recursively(v)
+
+    def __postProcess(self):
+        isJSONLD = self.dictOptions['is_json_ld']
+
+        # Process bindings into self.listResults...
+        self.__processBindings( self.dictSPARQLResults['results']['bindings'] )
+
+        # Merge lines with the same ID...
+        listProcessedResults = []
+        strAnchorKey = self.listResults[0]['$anchor'] if (len(self.listResults) > 0 and '$anchor' in self.listResults[0]) else None
+        if not strAnchorKey:
+            listProcessedResults = self.listResults
+        else: # Process anchor...
+            for dictResult in self.listResults:
+                strID = dictResult[strAnchorKey]
+                # Search for same ID..
+                listMatch = [dictPR for dictPR in listProcessedResults if dictPR[strAnchorKey] == strID]
+                if not listMatch:  # ...add a new one...
+                    listProcessedResults.append(dictResult)
+                else:  # Otherwise, modify the previous one...
+                    SPARQLTransformer.__mergeObject(listMatch[0], dictResult)
+
+        # Remove anchor tag...
+        for item in listProcessedResults:
+            SPARQLTransformer.__recursiveClean(item)
+
+        if 'limit' in self.dictOptions:
+            listProcessedResults = listProcessedResults[self.dictOptions['offset']: self.dictOptions['offset'] + self.dictOptions['limit']]
+
+        self.objResults = listProcessedResults
+        if isJSONLD:
+            self.objResults = {
+                '@context': self.dictOptions['context'],
+                '@graph': listProcessedResults
+            }
 
 
-def _prepare_orderby(array=None, keyword='ORDER BY'):
-    if array is None or len(array) == 0:
-        return ''
+    def __createSPARQLQuery(self):
+        """Read the input extracting the query and the graph prototype"""
 
-    sorted_array = sorted(array, key=lambda x: x.priority)
-    mapped_array = list(map(lambda s: 'DESC(%s)' % s['variable'] if 'desc' in s else s.variable, sorted_array))
-    return keyword + ' ' + ' '.join(mapped_array)
+        # Get the '@graph' or 'proto' properties object...
+        self.dictProperties = self.dictJSONQuery['@graph'] if '@graph' in self.dictJSONQuery else self.dictJSONQuery['proto']
+        if isinstance(self.dictProperties, list):
+            self.dictProperties = self.dictProperties[0]
+
+        # Get all the properties starting with '$'...
+        dictModifiers = {}
+        for key in list(self.dictJSONQuery):
+            if not key.startswith('$'):
+                continue
+            dictModifiers[key] = self.dictJSONQuery.pop(key, None)
+
+        #
+        # PREFIXES...
+        #
+        dictPrefixes = dictModifiers.get('$prefixes', None)
+        modEntry = self.__parsePrefixes(dictPrefixes)
+        qPrefixes = '\n'.join(modEntry) if (dictPrefixes != None) else ''
+
+        #
+        # SELECT...
+        #
+        modEntry = False if (dictModifiers.get('$distinct', None) == 'false') else True
+        qDistinct = 'DISTINCT' if (modEntry) else ''
+
+        listVars = [] # ...populate with the funcWhere() below...
+
+        #
+        # FROM / FROM NAMED...
+        #
+        modEntry = dictModifiers.get('$from', [])
+        if type(modEntry) is not list:
+            modEntry = [modEntry]
+        qFrom = '\n'.join([ 'FROM %s' % str_from for str_from in modEntry ])
+
+        modEntry = dictModifiers.get('$fromNamed', [])
+        if type(modEntry) is not list:
+            modEntry = [modEntry]
+        qFromNamed = '\n'.join([ 'FROM NAMED %s' % str_from for str_from in modEntry ])
+
+        #
+        # WHERE...
+        #
+        #   VALUES...
+        #   clauses...
+        #   filters...
+
+        # Preprocess values...
+        dictValues = dictModifiers.get('$values', None)
+        dictValuesNorm = self.__normalizeValues(dictValues)
+
+        # Preprocess clauses...
+        listWheres = dictModifiers.get('$where', [])
+        if type(listWheres) is not list:
+            listWheres = [listWheres]
+
+        # Preprocess filters...
+        listFilters = dictModifiers.get('$filter', [])
+        if type(listFilters) is not list:
+            listFilters = [listFilters]
+        strLangPrimary = dictModifiers.get('$lang')
+
+        # Process additional WHERE clause entries from Graph Body Properties:
+        # 1. For SELECT, create variables (listVars)
+        # 2. For WHERE, prepare VALUES (dictValuesNorm) and extend with graph prototype (modEntryWheres)
+        # NOTE: Currently, listFilters is unused but could be used if there is a need to calculate
+        #       additional filters to add to listFilters
+        funcWhere, _UNUSEDBlockRequired = SPARQLTransformer.__processProperties(
+                self.dictProperties, listVars, dictValuesNorm, listWheres, listFilters, strLangPrimary
+            )
+        for index, key in enumerate( list(self.dictProperties) ):
+            funcWhere(key, index)
+
+        # Variables...
+        qVars = ' '.join(listVars)
+
+        # Values...
+        bValuesExist = (dictValues != None)
+        qValues = ('\n'+INDENT).join(self.__parseValues(dictValuesNorm, dictPrefixes)) if bValuesExist else ''
+
+        # WHERE Clauses...
+        modEntry = []
+        for w in listWheres:
+            # If the where string actually has something...
+            if (w.strip()):
+                # ...add a where clause ender, ' .', unless a subclause or a start block character "{}[("...
+                modEntry.append( w + ('' if (w[-1] in "{}([") else ' .'))
+        qWheres = ('\n'+INDENT).join(modEntry)
+
+        # Filters...
+        modEntry = list(map(lambda f: 'FILTER(%s)' % f, listFilters))
+        qFilters = ('\n'+INDENT).join(modEntry)
+
+        #
+        # AGGREGATORS and LIMITERS...
+        #
+        modEntry = dictModifiers.get('$groupby', None)
+        if modEntry and type(modEntry) is not list:
+            modEntry = [modEntry]
+        qGroupBy = ('GROUP BY ' + ' '.join(modEntry)) if (modEntry) else ''
+
+        modEntry = dictModifiers.get('$having', None)
+        if modEntry and type(modEntry) is not list:
+            modEntry = [modEntry]
+        qHaving = ('HAVING (%s)' % ' && '.join(modEntry)) if (modEntry) else ''
+
+        modEntry = dictModifiers.get('$orderby', None)
+        if modEntry and type(modEntry) is not list:
+            modEntry = [modEntry]
+        qOrderBy = ('ORDER BY ' + ' '.join(modEntry)) if (modEntry) else ''
+
+        modEntry = dictModifiers.get('$limit', None)
+        bNotLibLimitMode = (dictModifiers.get('$limitMode', '') != 'library')
+        qLimit = ('LIMIT %d' % modEntry) if (modEntry and bNotLibLimitMode) else ''
+
+        modEntry = dictModifiers.get('$offset', None)
+        qOffset = ('OFFSET %d' % modEntry) if (modEntry and bNotLibLimitMode) else ''
+
+        # Assemble the query...
+        self.strSPARQLQuery = """%s
+SELECT %s %s
+%s
+%s
+WHERE {
+  %s
+  %s
+  %s
+}
+%s
+%s
+%s
+%s
+%s
+""" % ( qPrefixes,
+            qDistinct, qVars,
+            qFrom, qFromNamed,
+            qValues, qWheres, qFilters,
+            qGroupBy, qHaving, qOrderBy, qLimit, qOffset )
+
+        self.strSPARQLQuery = re.sub(r"\n+", "\n", self.strSPARQLQuery) # ...reduce multiple newlines (blank lines) to one
+        self.strSPARQLQuery = re.sub(r"\n\s+\n", "\n", self.strSPARQLQuery) # ...remove any other blank lines
+        self.strSPARQLQuery = re.sub(r"\.+", ".", self.strSPARQLQuery) # ...reduce multiple periods to one
+        logger.info("Query:\n" + self.strSPARQLQuery)
+        return
 
 
-def _parse_order(str, variable):
-    _ord = {'variable': variable, 'priority': 0}
-    s = str.split(':')
-
-    s.pop()  # first one is always 'order'
-
-    if 'desc' in s:
-        _ord['desc'] = True
-        s.pop(s.indexOf('desc'))
-
-    if len(s) > 0:
-        _ord.priority = int(s[0])
-
-    return _ord
+    def __normalizeValues(self, dictValues: dict | None) -> dict:
+        """Transform all keys of a object to a SPARQL variable"""
+        if dictValues is None:
+            return {}
+        dictNormValues = dict()
+        for strKey, strValue in dictValues.items():
+            if (strValue):
+                dictNormValues[ SPARQLTransformer.__makeSPARQLVariable(strKey) ] = strValue
+        return dictNormValues
 
 
-def _as_array(v):
-    if v is None:
-        return []
-    if isinstance(v, list):
-        return v
-    return [v]
+    def __defaultSPARQLQuery(self) -> Callable :
+        sparql = SPARQLWrapper(self.dictOptions['endpoint'])
+        sparql.setReturnFormat(JSON)
+
+        def executeQuery(strQuery):
+            sparql.setQuery(strQuery)
+            return sparql.queryAndConvert()
+
+        return executeQuery
 
 
-def _deepequals(a, b):
-    return a == b or dumps(a) == dumps(b)
+    def __parsePrefixes(self, dictPrefixes: dict) -> list[str] :
+        return list( map( lambda key: 'PREFIX %s: <%s>' % (key, dictPrefixes[key]), dictPrefixes.keys() ) )
+
+
+    # Parser for VALUES Clause
+    def __parseValues(self, dictValues: dict, dictPrefixes: dict) -> list[str] :
+        listParsedValues = []
+        for strValueKey in dictValues:
+            listValues = []
+            objValue = dictValues[strValueKey]
+            if objValue and type(objValue) is not list:
+                objValue = [objValue]
+            for strValue in objValue:
+                # NOTE: Cursory Inspection of VALUES
+                #       We expect VALUES elements are well-formed just like WHERE elements,
+                #       but we'll do a little checking anyway...
+
+                # Resource: IRI...
+                if strValue.startswith('<') and strValue.endswith('>'):
+                    listValues.append(strValue)
+                # Resource: CIRIE...
+                elif isCIRIE(strValue, dictPrefixes):
+                    listValues.append(strValue)
+                # Literal: Value with Language...
+                elif re.match(r'^.+@[a-z]{2,3}(_[A-Z]{2})?$', strValue):
+                    strPart, strLang = strValue.split('@')
+                    if strPart.startswith('"') and strPart.endswith('"'):
+                        listValues.append(strValue)
+                    else:
+                        listValues.append('"%s"@%s' % (strPart, strLang))
+                # Literal: Value with Datetype...
+                elif re.match(r'^.+^^.+$', strValue):
+                    strPart, strType = strValue.split('^^')
+                    if not ( strPart.startswith('"') and strPart.endswith('"') ):
+                        strPart = '"%s"' % strPart
+                    if not ( ( strType.startswith('<') and strType.endswith('>') ) or isCIRIE(strType, dictPrefixes) ):
+                        strType = '<%s>' % strType
+                    listValues.append('%s^^%s' % (strPart, strType))
+                # Literal: anything else...
+                elif strValue.startswith('"') and strValue.endswith('"'):
+                    listValues.append(strValue)
+                elif strValue.find('\n') != -1 or strValue.find('"') != -1:
+                    listValues.append('"""%s"""' % strValue)
+                else:
+                    listValues.append('"%s"' % strValue)
+            listParsedValues.append('VALUES %s {%s}' % (SPARQLTransformer.__makeSPARQLVariable(strValueKey), ' '.join(listValues)))
+        return listParsedValues
+
+
+    def __processBindings(self, listResults: list | None):
+        # Create a list of processed results from:
+        # 1. each result from the list of raw results
+        # 2. a copy of the properties that fits the result
+        self.listResults = []
+        for self.objResult in listResults:
+            """Apply the property rules to a single result of the query results"""
+            objWorkingResult = copy.deepcopy(self.dictProperties)
+            for strWRKey in list(objWorkingResult):
+                self.__fitResult(strWRKey, objWorkingResult)
+            self.listResults.append(objWorkingResult)
+
+
+    def __fitResult(self, strWRKey: str, objWorkingResult: dict):
+        """Apply the SPARQL result to a single property of the properties"""
+        objVariable = objWorkingResult[strWRKey]
+
+        # If the variable is a dictionary...
+        if isinstance(objVariable, dict):
+            objAsList = objVariable.get('$asList', False)
+            for strSubWRKey in list(objVariable): # ...list() because we change the objVariable
+                self.__fitResult(strSubWRKey, objVariable)
+            # If any of the result entries do NOT contain a '@type' or '$anchor' key,
+            # throw away (pop off) the result...
+            bTypeAnchor = True
+            for strVarKey in objVariable:
+                if strVarKey not in ['@type', '$anchor']:
+                    bTypeAnchor = False
+            if bTypeAnchor:
+                objWorkingResult.pop(strWRKey)
+            # If we need a list...
+            if objAsList:
+                objWorkingResult[strWRKey] = [ objWorkingResult[strWRKey] ]
+            return
+
+        # Otherwise, if NOT a variable (a String that starts with '?')...
+        if not (isinstance(objVariable, str) and objVariable.startswith('?')):
+            return
+
+        # So, we have a variable (a String that starts with '?')...
+        objVariable = objVariable[1:]
+        accept = None
+        langTag = self.dictOptions['langTag']
+        asList = "$asList" in objVariable
+        objVariable = objVariable.replace("$asList", "")
+
+        if "$accept:" in objVariable:
+            listLangParts = objVariable.split('$accept:')
+            objVariable = listLangParts[0]
+            accept = listLangParts[1]
+        if "$langTag:" in objVariable:
+            listLangParts = objVariable.split('$langTag:')
+            objVariable = listLangParts[0]
+            langTag = listLangParts[1]
+
+        # If the variable not in the raw result, delete it from the working result...
+        if objVariable not in self.objResult:
+            objWorkingResult.pop(strWRKey)
+        else:
+            dictWorkingOpts = self.dictOptions.copy()
+            dictWorkingOpts['accept'] = accept
+            dictWorkingOpts['langTag'] = langTag
+            dictWorkingOpts['list'] = asList
+
+            # Transform the raw result value into our JSON-LD result value...
+            objWorkingResult[strWRKey] = SPARQLTransformer.__toJSONLDValue(self.objResult[objVariable], strWRKey, dictWorkingOpts)
+            if objWorkingResult[strWRKey] is None:
+                objWorkingResult.pop(strWRKey)
+
+    @staticmethod
+    def __toJSONLDValue(dictResultValue: dict, strWRKey: str, dictWorkingOpts: dict):
+        """ Prepare the output managing languages and datatypes.
+            The following code just converts a standard SPARQL JSON result into a
+            more compact JSON format (JSON-LD or PROTO -ish).
+            Any unknown / unrecognised elements result in a "None" conversion.
+        """
+        strInType = dictResultValue.get('type', None)
+        if strInType not in SPARQLTransformer._RDF_VALUE_TYPES:
+            return None
+        strInValue = dictResultValue.get('value', None)
+
+        bList = dictWorkingOpts.get('list', False)
+
+        if strInType == 'uri': # ...URI are always key:value pairs--no futher checking required!
+            # Prepare an IRI return value...
+            retVal = strInValue
+
+            # Get the ID specifier for an IRI...
+            strIDKey = dictWorkingOpts['voc']['id']
+            # If we are NOT working on an ID result...
+            if (strWRKey != strIDKey):
+                retVal = { strIDKey: strInValue } # ...store the IRI as an ID result
+
+            # Return either a list result OR the result...
+            return [retVal] if bList else retVal
+
+        if strInType == 'literal':
+            inDatatype = dictResultValue.get('datatype', None)
+            inLanguage = dictResultValue.get('xml:lang', None)
+            bCompound = False
+            if inDatatype:
+                if inDatatype in XSD.XSD_BOOLEAN_TYPES:
+                    strInValue = strInValue not in ['false', '0', 0, 'False', False]
+                elif inDatatype in XSD.XSD_INT_TYPES:
+                    strInValue = int(strInValue)
+                elif inDatatype in XSD.XSD_FLOAT_TYPES:
+                    strInValue = strInValue.replace('INF', 'inf')
+                    strInValue = float(strInValue)
+                elif inDatatype in XSD.XSD_DATE_TYPES:
+                    # Leave as string...
+                    # NOTE: Possible date checking, but we assume the datastore knows
+                    #       and checks known XSD datatypes!
+                    bCompound = True
+                else: # ...any other unrecognized datatype will be compound...
+                    # Leave as string...
+                    bCompound = True
+            elif inLanguage:
+                if dictWorkingOpts['langTag'] != 'hide':
+                    bCompound = True
+            # Otherwise, a simple literal string value...
+
+            typeAccept = dictWorkingOpts.get('accept', None)
+            # If we need an acceptable type...
+            if typeAccept:
+                typeKnowns = SPARQLTransformer._KNOWN_ACCESS_TYPES.get(typeAccept, None)
+                # ...it should have a known acceptable type list...
+                if typeKnowns:
+                    # Compare the value type to that acceptable type list...
+                    if type(strInValue) not in typeKnowns:
+                        return None # ...unacceptable type!
+                    # Otherwise, good type!
+                # Otherwise, bad accept type (no list)...
+                else:
+                    logger.error(f'TYPE ACCEPT ERROR: Unknown accept type [{typeAccept}]! Skipping accept validation.')
+
+            # Prepare a a simple literal string return value...
+            retVal = strInValue
+            # If the value needs a datatype or language specifier...
+            if bCompound:
+                voc = dictWorkingOpts['voc']
+                # If the value has a datatype...
+                if inDatatype:
+                    # ...prepare a compound datatype return value...
+                    retVal = {
+                        voc['value']: strInValue,
+                        voc['dtype']: inDatatype
+                    }
+                # If the value has a language...
+                elif inLanguage:
+                    # ...prepare a compound language return value...
+                    retVal = {
+                        voc['value']: strInValue,
+                        voc['lang']: inLanguage
+                    }
+            # Otherwise, return a simple literal string...
+            return [retVal] if bList else retVal
+
+        # Otherwise, the type is unknown...
+        return None
+
+    @staticmethod
+    def __mergeObject(base, addition):
+        """Merge base and addition, by defining/adding in an array the values in addition to the base object.
+        Return the base object merged."""
+        for k in list(addition):
+            if k == '$anchor':
+                continue
+
+            a = addition[k]
+            if k not in base:
+                base[k] = a
+                continue
+
+            b = base[k]
+
+            anchor = None
+            if isinstance(a, dict) and '$anchor' in a:
+                anchor = a['$anchor']
+
+            # If a is an array, take its first value...
+            if isinstance(a, list):
+                a = a[0]
+
+            if isinstance(b, list):
+                if anchor:
+                    same_ids = [x for x in b if anchor in x and a[anchor] == x[anchor]]
+                    if len(same_ids) > 0:
+                        SPARQLTransformer.__mergeObject(same_ids[0], a)
+                        continue
+
+                if not any([SPARQLTransformer.__deepEquals(x, a) for x in b]):
+                    b.append(a)
+                continue
+
+            if SPARQLTransformer.__deepEquals(a, b):
+                continue
+
+            if anchor and anchor in b and a[anchor] == b[anchor]:  # same ids
+                SPARQLTransformer.__mergeObject(b, a)
+            else:
+                base[k] = [b, a]
+
+        return base
+
+    @staticmethod
+    def __makeSPARQLVariable(strVar : str) -> str :
+        """Add the "?" if absent"""
+        return strVar if strVar.startswith('?') else '?' + strVar
+
+    @staticmethod
+    def __processProperties(
+        dictProperty: dict, listVars: list = [], dictValues: dict = {}, listWheres: list = [], listFilters: list = [],
+        strLangPrimary: str = None, strPrefix: str = "v", strIDPriorRoot: str = None
+    ):
+        """Parse a single key in prototype"""
+        strIDRoot, isBlockRequired = SPARQLTransformer.__computeRootID(dictProperty, strPrefix)
+        strIDRoot = strIDRoot or strIDPriorRoot or '?id'
+
+        def processWhere(keyMaster, indexMaster : int = None):
+            if keyMaster == '$anchor' or keyMaster == '$asList':
+                return
+
+            objSubProperty = dictProperty[keyMaster]
+
+            # Process Property as an Dictionary of Properties...
+            # ============================================================
+            if isinstance(objSubProperty, dict):
+                listWheresInner = []
+                funcWhere, isBlockRequiredInner = SPARQLTransformer.__processProperties(
+                        objSubProperty, listVars, dictValues, listWheresInner, listFilters,
+                        strLangPrimary, strPrefix + str(indexMaster) if indexMaster else "", strIDRoot
+                    )
+
+                for indexSub, keySub in enumerate(list(objSubProperty)):
+                    funcWhere(keySub, indexSub)
+
+                strWheres = ' .\n'.join(listWheresInner)
+                if (strWheres != ''):
+                    listWheres.append(strWheres if isBlockRequiredInner else 'OPTIONAL { %s }' % strWheres)
+                return
+
+            # Process Property as a Single Property...
+            # ============================================================
+            if not isinstance(objSubProperty, str):
+                return
+
+            # Get the Proto Key...
+            isKeyed = objSubProperty.startswith('$')
+            if not isKeyed and not objSubProperty.startswith('?'):
+                return
+            if isKeyed:
+                objSubProperty = objSubProperty[1:]
+
+            # Carve off the Proto Options after the Proto Key...
+            listSubPropertyOptions = []
+            if '$' in objSubProperty:
+                listSubPropertyOptions = objSubProperty.split('$')
+                objSubProperty = listSubPropertyOptions.pop(0)
+
+            strIDOriginal = ('?' + strPrefix + str(indexMaster)) if isKeyed else objSubProperty
+            strID = strIDOriginal
+
+            listOptVars = [strOpt for strOpt in listSubPropertyOptions if strOpt.startswith('var:')]
+            if len(listOptVars) > 0:
+                strID = SPARQLTransformer.__makeSPARQLVariable( listOptVars[0].split(':')[1] )
+
+            listAccept = [strOpt for strOpt in listSubPropertyOptions if strOpt.startswith('accept')]
+            listBestlang = [strOpt for strOpt in listSubPropertyOptions if strOpt.startswith('bestlang')]
+            listLangTag = [strOpt for strOpt in listSubPropertyOptions if strOpt.startswith('langTag')]
+
+            listAggregate = [a for a in SPARQLTransformer._AGGREGATES if a in listSubPropertyOptions]
+            idAggregate = strID if isKeyed else strIDOriginal
+            if len(listAggregate) > 0 and len(listOptVars) == 0:
+                strID = strIDOriginal if isKeyed else f"?{listAggregate[0]}_{strIDOriginal.replace('?', '')}"
+
+            # If there is an ID or a specified value, then this property can not be optional...
+            isRequired = (
+                'required' in listSubPropertyOptions or
+                keyMaster in ['id', '@id'] or
+                strID in dictValues or
+                ( len(listAggregate) > 0 and isKeyed )
+            )
+
+            dictProperty[keyMaster] = strID
+
+            strVar = strID
+            if 'sample' in listSubPropertyOptions:
+                strVar = '(SAMPLE(%s) AS %s)' % (strID, strID)
+
+            if len(listAggregate) > 0:
+                strDistinct = 'DISTINCT ' if 'distinct' in listSubPropertyOptions else ''
+                strVar = f"({listAggregate[0].upper()}({strDistinct}{idAggregate}) AS {strID})"
+
+            if len(listBestlang) > 0:
+                strBestlang = listBestlang[0]
+                dictProperty[keyMaster] = strID + '$accept:string'
+                strBestLang = strBestlang.split(':')[1] if ':' in strBestlang else strLangPrimary
+                if strBestLang is None:
+                    raise AttributeError('bestlang require a language declared inline or in the root')
+                strVar = '(sql:BEST_LANGMATCH(%s, "%s", "en") AS %s)' % (strID, strBestLang, strID)
+            elif len(listAccept) > 0:
+                dictProperty[keyMaster] = strID + '$' + listAccept[0]
+
+            if len(listLangTag) > 0:
+                dictProperty[keyMaster] = dictProperty[keyMaster] + '$' + listLangTag[0]
+
+            if 'list' in listSubPropertyOptions and strID != strIDRoot:
+                dictProperty[keyMaster] += '$asList'
+
+            if strVar not in listVars:
+                listVars.append(strVar)
+
+            # Manage language filters so they stay within the OPTIONAL...
+            filterLang = ''
+            strLang = [SPARQLTransformer._LANG_REGEX.match(strOpt).group(1) for strOpt in listSubPropertyOptions if SPARQLTransformer._LANG_REGEX.match(strOpt)]
+
+            if len(strLang) > 0:
+                strLang = strLang[0]
+                if strLang is None and strLangPrimary is not None:
+                    strLang = re.split('[;,]', strLangPrimary)[0]
+                if strLang:
+                    strLang = strLang.strip()
+                    if strID in dictValues and type(dictValues[strID]) == str:
+                        dictValues[strID] += '@' + strLang
+                    else:
+                        filterLang = " . FILTER(lang(%s) = '%s')" % (strID, strLang)
+
+            bReverse = 'reverse' in listSubPropertyOptions
+            if isKeyed:
+                usePriorRoot = (strID == strIDRoot) or ('prevRoot' in listSubPropertyOptions and strIDPriorRoot is not None)
+
+                idThisRoot = strIDPriorRoot if usePriorRoot else strIDRoot
+
+                strSubject = strID if bReverse else idThisRoot
+                strObject = idThisRoot if bReverse else strID
+
+                strWhere = ' '.join([strSubject, objSubProperty, strObject])
+                strWhere += filterLang
+                if (strWhere != ''):
+                    listWheres.append(strWhere if isRequired else 'OPTIONAL { %s }' % strWhere)
+
+        return processWhere, isBlockRequired
+
+    @staticmethod
+    def __computeRootID(dictProperty: dict, strPrefix: str) -> tuple[str, bool]:
+        strAnchorKey = None
+
+        # Check for an anchor...
+        for strItemKey, objItemValue in dictProperty.items():
+            if type(objItemValue) == str and '$anchor' in objItemValue:
+                strAnchorKey = strItemKey
+                break
+
+        # Otherwise, check for a default anchor...
+        if strAnchorKey is None:
+            for strItemKey, objItemValue in SPARQLTransformer._KEY_VOCABULARIES.items():
+                if SPARQLTransformer._KEY_VOCABULARIES[strItemKey]['id'] in dictProperty:
+                    strAnchorKey = SPARQLTransformer._KEY_VOCABULARIES[strItemKey]['id']
+                    break
+
+        if strAnchorKey is None:
+            return (None, None)
+
+        strAnchorValue = dictProperty[strAnchorKey]
+        listAnchorParts = strAnchorValue.split('$')
+        strRootID = listAnchorParts.pop(0)
+
+        bRequired = True if 'required' in listAnchorParts else (not not strRootID)
+        listVars = [strPart for strPart in listAnchorParts if strPart.startswith('var:')]
+        if len(listVars) > 0:
+            strRootID = SPARQLTransformer.__makeSPARQLVariable( listVars[0].split(':')[1] )
+
+        if not strRootID:  # ...generate a Root ID
+            strRootID = "?" + strPrefix + "r"
+            dictProperty[strAnchorKey] += '$var:' + strRootID
+
+        dictProperty['$anchor'] = strAnchorKey
+        dictProperty['$asList'] = '$asList' in dictProperty[strAnchorKey]
+        return (strRootID, bRequired)
+
+    @staticmethod
+    def __recursiveClean(objItem):
+        # Remove development properties...
+
+        if isinstance(objItem, list):
+            for item in objItem:
+                SPARQLTransformer.__recursiveClean(item)
+            return
+
+        if isinstance(objItem, dict):
+            objItem.pop('$anchor', None)  # ...remove $anchor
+            objItem.pop('$asList', None)  # ...remove $asList
+            for key, item in objItem.items():
+                SPARQLTransformer.__recursiveClean(item)
+
+    @staticmethod
+    def __prepareGroupBy(dictGroupBy: dict | None = None) -> str :
+        if dictGroupBy is None:
+            return ''
+
+        for dictGroupItem in dictGroupBy:
+            if 'desc' in dictGroupItem:
+                dictGroupItem.pop('desc')
+
+        return SPARQLTransformer.__prepareSomeBy(dictGroupBy, 'GROUP BY')
+
+    @staticmethod
+    def __prepareSomeBy(dictSomeBy: dict | None = None, strSomeBy: str = 'ORDER BY') -> str:
+        if dictSomeBy is None or len(dictSomeBy) == 0:
+            return ''
+
+        listSortedSomeBy = sorted(dictSomeBy, key = lambda x: x.priority)
+        listOrder = list( map(
+            lambda
+                dictSorted :
+                'DESC(%s)' % dictSorted['variable'] if 'desc' in dictSorted
+                else dictSorted.variable, listSortedSomeBy
+            ) )
+        return strSomeBy + ' ' + ' '.join(listOrder)
+
+    @staticmethod
+    def __parseOrder(strOrder: str, strVariable: str):
+        dictOrder = { 'variable': strVariable, 'priority': 0 }
+        listOrderParts = strOrder.split(':')
+
+        listOrderParts.pop() # ...the first string is always 'order'
+        if 'desc' in listOrderParts:
+            dictOrder['desc'] = True
+            listOrderParts.pop( listOrderParts.indexOf('desc') )
+
+        if len(listOrderParts) > 0:
+            dictOrder.priority = int( listOrderParts[0] )
+
+        return dictOrder
+
+    @staticmethod
+    def __deepEquals(a, b):
+        return a == b or dumps(a) == dumps(b)
+
+g_reAllowedPrefix = re.compile(r"^\w+[\w\d!$&'()*+,\-.:;=?@_~]*$", re.UNICODE)
+g_reAllowedSuffix = re.compile(r"^[\w\d!$&'()*+,\-.:;=?@_~]+$", re.UNICODE)
+
+def isCIRIE(strIRI: str, dictPrefixes: dict):
+    """
+    Returns True if given IRI string is a condensed IRI expression,
+    False otherwise.
+
+    A condensed IRI expression is detected when the string contains two elements
+    separated by a colon, both elements are alphanumeric, and the leading element
+    is a given prefix.
+
+    If the leading element is NOT a given prefix, it is considered a full IRI and
+    not a CIRIE.
+    """
+    parts = strIRI.split(":")
+    if len(parts) != 2:
+        return False
+    strPrefix, strSuffix = parts
+
+    # CIRIE...
+    if not g_reAllowedPrefix.fullmatch(strPrefix):
+        return False
+    if not g_reAllowedSuffix.fullmatch(strSuffix):
+        return False
+    for strItemPrefix, strItemNamespace in dictPrefixes.items():
+        if strPrefix == strItemPrefix:
+            return True
+    return False
+
+def isBlank(strIRI: str):
+    parts = strIRI.split(":")
+    if len(parts) != 2:
+        return False
+    strPrefix, strSuffix = parts
+
+    # Blank Node...
+    if strPrefix == '_':
+        if not g_reAllowedSuffix.fullmatch(strSuffix):
+            return False
+        return True
+    return False
+
+def isCIRIEorBlank(strIRI: str, dictPrefixes: dict):
+    return isCIRIE(strIRI, dictPrefixes) or isBlank(strIRI)
